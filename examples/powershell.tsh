@@ -1,0 +1,19 @@
+class Project {
+  constructor(public name: string) {}
+
+  prepare(): void {
+    mkdir(this.name, { recursive: true });
+    echo(`Created project: ${this.name}`);
+  }
+}
+
+const project = new Project("demo");
+
+project.prepare();
+
+// @cfg(shell("pwsh"))
+raw!(`
+Write-Host 'Running on PowerShell'
+`);
+
+echo("Done!");

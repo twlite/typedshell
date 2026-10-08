@@ -1,0 +1,5 @@
+/target/
+/demo/
+/examples/*.sh
+/examples/*.ps1
+/hello.sh

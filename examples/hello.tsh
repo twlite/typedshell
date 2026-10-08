@@ -1,0 +1,26 @@
+import { chmod } from "tsh:unix";
+
+// @cfg(macos)
+const platform = "macOS";
+// @cfg(linux)
+const platform = "Linux";
+// @cfg(freebsd)
+const platform = "FreeBSD";
+
+/** Each project keeps its own instance state. */
+class Project {
+  constructor(public name: string) {}
+
+  prepare(): void {
+    mkdir(this.name, { recursive: true });
+    echo(`Created ${this.name} on ${platform}`);
+  }
+}
+
+const project = new Project("demo");
+project.prepare();
+chmod("demo", 0o755);
+
+raw!(`
+printf '%s\n' 'Native Bash works!'
+`);

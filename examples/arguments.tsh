@@ -1,0 +1,4 @@
+// Script arguments remain native Bash arguments inside raw shell.
+raw!(`
+printf 'argument: <%s>\n' "$@"
+`);

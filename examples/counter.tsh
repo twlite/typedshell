@@ -1,0 +1,20 @@
+class Counter {
+  value: number = 0;
+  constructor(public name: string) {}
+
+  /**
+   * Generates and stores the next value
+   * @returns current value
+   */
+  next(): number {
+    this.value = this.value + 1;
+    return this.value;
+  }
+}
+
+const first = new Counter("first");
+const second = new Counter("second");
+for (let i = 0; i < 3; i++) {
+  echo(`${first.name}: ${first.next()}`);
+}
+echo(`${second.name}: ${second.next()}`);
