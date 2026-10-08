@@ -3,7 +3,7 @@ name = "tsh"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
-description = "A typed TypeScript subset compiled to standalone Bash"
+description = "A typed TypeScript subset compiled to standalone Bash or other shell targets"
 license = "MIT"
 
 [dependencies]

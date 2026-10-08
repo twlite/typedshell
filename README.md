@@ -1,4 +1,4 @@
-# tsh
+# TypedShell
 
 `tsh` is an experimental language implemented in Rust that compiles a statically
 checked subset of TypeScript syntax into readable, standalone shell scripts.
@@ -119,17 +119,17 @@ object is accepted for `mkdir`/`rm`.
 
 Core shell operations are globally available:
 
-| Operation | Behavior |
-| --- | --- |
-| `echo(value)` | Print one value followed by a newline |
-| `mkdir(path, { recursive: true })` | Create a directory, optionally including parents |
-| `rm(path, { recursive: true })` | Remove a path, optionally recursively |
-| `cp(source, destination)` | Copy a file |
-| `mv(source, destination)` | Move a path |
-| `cd(path)` | Change the script's working directory |
-| `run(command, [args...])` | Execute a command with separately quoted arguments |
-| `env(name)` | Read an environment variable; unset variables yield an empty string |
-| `exit(code)` | Terminate the script, defaulting to zero |
+| Operation                          | Behavior                                                            |
+| ---------------------------------- | ------------------------------------------------------------------- |
+| `echo(value)`                      | Print one value followed by a newline                               |
+| `mkdir(path, { recursive: true })` | Create a directory, optionally including parents                    |
+| `rm(path, { recursive: true })`    | Remove a path, optionally recursively                               |
+| `cp(source, destination)`          | Copy a file                                                         |
+| `mv(source, destination)`          | Move a path                                                         |
+| `cd(path)`                         | Change the script's working directory                               |
+| `run(command, [args...])`          | Execute a command with separately quoted arguments                  |
+| `env(name)`                        | Read an environment variable; unset variables yield an empty string |
+| `exit(code)`                       | Terminate the script, defaulting to zero                            |
 
 Native command failures terminate the script with the actual failing exit code.
 The backend checks command status explicitly instead of using `set -e` as language
