@@ -10,6 +10,10 @@ fn compile(source: &str) -> String {
         .unwrap_or_else(|e| panic!("{e:?}"))
 }
 fn execute(source: &str) -> (i32, String, String) {
+    execute_with_env(source, &[])
+}
+
+fn execute_with_env(source: &str, environment: &[(&str, &str)]) -> (i32, String, String) {
     let script = compile(source);
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("standalone.sh");
@@ -19,6 +23,7 @@ fn execute(source: &str) -> (i32, String, String) {
         .current_dir(dir.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .envs(environment.iter().copied())
         .spawn()
         .expect("Bash required for integration tests");
     let deadline = Instant::now() + Duration::from_secs(10);
@@ -41,6 +46,21 @@ fn output(source: &str) -> String {
     let (code, out, err) = execute(source);
     assert_eq!(code, 0, "{err}");
     out
+}
+
+fn bash_path(path: &Path) -> String {
+    let path = path.to_string_lossy().replace('\\', "/");
+    #[cfg(windows)]
+    if let Some((drive, rest)) = path.split_once(":/")
+        && drive.len() == 1
+    {
+        return format!(
+            "/{}/{}",
+            drive.to_ascii_lowercase(),
+            rest.trim_start_matches('/')
+        );
+    }
+    path
 }
 fn rejects(source: &str) {
     assert!(
@@ -398,6 +418,104 @@ fn env_returns_value_without_execution() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8(out.stdout).unwrap(), "a b $HOME\n");
+}
+
+#[test]
+fn typedshell_host_info_and_environment_api() {
+    let out = output(
+        "echo(TypedShell.platform()); echo(TypedShell.arch()); echo(TypedShell.homedir()); TypedShell.setEnv('TSH_TYPEDSHELL_API', 'a b $HOME'); setEnv('TSH_TYPEDSHELL_GLOBAL_API', 'global'); echo(env('TSH_TYPEDSHELL_API')); echo(env('TSH_TYPEDSHELL_GLOBAL_API'));",
+    );
+    let mut lines = out.lines();
+    let expected_platform = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        other => other,
+    };
+    let expected_arch = match std::env::consts::ARCH {
+        "x86_64" | "amd64" => "x86_64",
+        "aarch64" | "arm64" => "aarch64",
+        "x86" | "i386" | "i586" | "i686" => "x86",
+        "arm" | "armv7" | "armv7l" => "arm",
+        other => other,
+    };
+    let expected_home = std::env::var("HOME").unwrap_or_default();
+    assert_eq!(lines.next(), Some(expected_platform));
+    assert_eq!(lines.next(), Some(expected_arch));
+    assert_eq!(lines.next(), Some(expected_home.as_str()));
+    assert_eq!(lines.next(), Some("a b $HOME"));
+    assert_eq!(lines.next(), Some("global"));
+    assert_eq!(lines.next(), None);
+}
+
+#[test]
+fn typedshell_add_path_is_idempotent_and_quotes_profile_values() {
+    let home = tempfile::tempdir().unwrap();
+    let home_string = bash_path(home.path());
+    let path_entry = format!("{home_string}/bin with ' quote $HOME");
+    let source = format!(
+        "TypedShell.addPath(\"{path_entry}\"); TypedShell.addPath(\"{path_entry}\"); echo(env('PATH'));"
+    );
+    let (code, output, error) =
+        execute_with_env(&source, &[("HOME", &home_string), ("SHELL", "/bin/zsh")]);
+    assert_eq!(code, 0, "{error}");
+    assert_eq!(
+        output
+            .trim_end()
+            .split(':')
+            .filter(|entry| *entry == path_entry)
+            .count(),
+        1
+    );
+    for profile in [".zshrc", ".zprofile"] {
+        let profile_path = home.path().join(profile);
+        let profile_bash_path = bash_path(&profile_path);
+        let contents = std::fs::read_to_string(&profile_path).unwrap();
+        assert_eq!(contents.matches("case \":$PATH:\"").count(), 1);
+        assert!(
+            Command::new("bash")
+                .args(["-n"])
+                .arg(&profile_bash_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let sourced = Command::new("bash")
+            .args([
+                "--noprofile",
+                "--norc",
+                "-c",
+                r#"PATH=/usr/bin; . "$1"; . "$1"; printf '%s\n' "$PATH""#,
+                "bash",
+            ])
+            .arg(&profile_bash_path)
+            .env("HOME", &home_string)
+            .output()
+            .unwrap();
+        assert!(sourced.status.success());
+        assert_eq!(
+            String::from_utf8(sourced.stdout)
+                .unwrap()
+                .matches(&path_entry)
+                .count(),
+            1
+        );
+    }
+
+    let fish_home = tempfile::tempdir().unwrap();
+    let fish_home_string = bash_path(fish_home.path());
+    let fish_path = format!("{fish_home_string}/bin with ' quote $HOME");
+    let fish_source =
+        format!("TypedShell.addPath(\"{fish_path}\"); TypedShell.addPath(\"{fish_path}\");");
+    let (code, _, error) = execute_with_env(
+        &fish_source,
+        &[("HOME", &fish_home_string), ("SHELL", "/usr/bin/fish")],
+    );
+    assert_eq!(code, 0, "{error}");
+    let fish_profile = fish_home.path().join(".config/fish/conf.d/typedshell.fish");
+    let fish_contents = std::fs::read_to_string(fish_profile).unwrap();
+    assert_eq!(fish_contents.matches("fish_add_path ").count(), 1);
+    assert!(fish_contents.contains("\\' quote $HOME'"));
 }
 #[test]
 fn local_modules_are_bundled() {

@@ -48,6 +48,14 @@ pub enum ExprKind {
         args: Vec<Expr>,
     },
     Env(Box<Expr>),
+    HostInfo(HostInfo),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostInfo {
+    Platform,
+    Architecture,
+    HomeDir,
 }
 #[derive(Debug, Clone)]
 pub enum Place {
@@ -107,6 +115,8 @@ pub enum Command {
     Run,
     Exit,
     Chmod,
+    SetEnv,
+    AddPath,
 }
 #[derive(Debug, Clone)]
 pub struct Param {

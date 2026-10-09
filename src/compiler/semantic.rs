@@ -2122,6 +2122,9 @@ impl<'u, 'opts, 'ids> Lowerer<'u, 'opts, 'ids> {
                     let raw = self.lower_raw_call(call)?;
                     return Ok(vec![Stmt::Raw(raw)]);
                 }
+                if let Some(command) = typed_shell_command(&call.callee) {
+                    return self.lower_command(command, call);
+                }
                 if let Some(name) = direct_identifier(&call.callee)
                     && let Some(command) = command_for_name(name)
                     && !self.functions.contains_key(name)
@@ -2152,7 +2155,14 @@ impl<'u, 'opts, 'ids> Lowerer<'u, 'opts, 'ids> {
         command: ir::Command,
         call: &oxc_ast::ast::CallExpression<'a>,
     ) -> Result<Vec<Stmt>, CompileError> {
-        let name = direct_identifier(&call.callee).unwrap_or("command");
+        let name = match &call.callee {
+            Expression::StaticMemberExpression(member)
+                if direct_identifier(&member.object) == Some("TypedShell") =>
+            {
+                member.property.name.as_str()
+            }
+            _ => direct_identifier(&call.callee).unwrap_or("command"),
+        };
         let mut recursive = false;
         let path_args: Vec<IrExpr> = match command {
             ir::Command::Mkdir | ir::Command::Rm => {
@@ -2253,6 +2263,32 @@ impl<'u, 'opts, 'ids> Lowerer<'u, 'opts, 'ids> {
                         call.span,
                         "chmod mode must be a number or string",
                     ));
+                }
+                args
+            }
+            ir::Command::SetEnv | ir::Command::AddPath => {
+                let args = self.lower_command_args(call)?;
+                let expected = if command == ir::Command::SetEnv { 2 } else { 1 };
+                let command_label = if matches!(&call.callee, Expression::StaticMemberExpression(_))
+                {
+                    format!("TypedShell.{name}")
+                } else {
+                    name.to_owned()
+                };
+                if args.len() != expected {
+                    let signature = if command == ir::Command::SetEnv {
+                        "a variable name and value"
+                    } else {
+                        "exactly one path"
+                    };
+                    return Err(err(
+                        self.unit,
+                        call.span,
+                        format!("{command_label} expects {signature}"),
+                    ));
+                }
+                for arg in &args {
+                    ensure_type(self.unit, call.span, &Type::String, &arg.ty)?;
                 }
                 args
             }
@@ -2696,6 +2732,40 @@ impl<'u, 'opts, 'ids> Lowerer<'u, 'opts, 'ids> {
         }
         if let Expression::StaticMemberExpression(member) = &call.callee {
             let method_name = member.property.name.as_str();
+            if direct_identifier(&member.object) == Some("TypedShell") {
+                let info = match method_name {
+                    "platform" => Some(ir::HostInfo::Platform),
+                    "arch" => Some(ir::HostInfo::Architecture),
+                    "homedir" => Some(ir::HostInfo::HomeDir),
+                    "setEnv" | "addPath" => {
+                        return Err(err(
+                            self.unit,
+                            call.span,
+                            format!(
+                                "TypedShell.{method_name} can only be used as a standalone statement"
+                            ),
+                        ));
+                    }
+                    _ => {
+                        return Err(err(
+                            self.unit,
+                            member.span,
+                            format!("TypedShell has no API named `{method_name}`"),
+                        ));
+                    }
+                };
+                if !call.arguments.is_empty() {
+                    return Err(err(
+                        self.unit,
+                        call.span,
+                        format!("TypedShell.{method_name} expects no arguments"),
+                    ));
+                }
+                return Ok(IrExpr {
+                    kind: ExprKind::HostInfo(info.expect("known host info method")),
+                    ty: Type::String,
+                });
+            }
             if let Some(class_name) = direct_identifier(&member.object)
                 && let Some(class) = self.classes.get(class_name).cloned()
             {
@@ -3321,6 +3391,20 @@ fn is_raw_macro(expression: &Expression<'_>) -> bool {
     matches!(expression, Expression::TSNonNullExpression(non_null) if direct_identifier(&non_null.expression) == Some("raw"))
 }
 
+fn typed_shell_command(expression: &Expression<'_>) -> Option<ir::Command> {
+    let Expression::StaticMemberExpression(member) = expression else {
+        return None;
+    };
+    if direct_identifier(&member.object) != Some("TypedShell") {
+        return None;
+    }
+    match member.property.name.as_str() {
+        "setEnv" => Some(ir::Command::SetEnv),
+        "addPath" => Some(ir::Command::AddPath),
+        _ => None,
+    }
+}
+
 fn command_for_name(name: &str) -> Option<ir::Command> {
     Some(match name {
         "echo" => ir::Command::Echo,
@@ -3332,6 +3416,7 @@ fn command_for_name(name: &str) -> Option<ir::Command> {
         "run" => ir::Command::Run,
         "exit" => ir::Command::Exit,
         "chmod" => ir::Command::Chmod,
+        "setEnv" => ir::Command::SetEnv,
         _ => return None,
     })
 }
@@ -3951,6 +4036,13 @@ fn infer_expr_type_with_locals<'a>(
                 }
             } else if let Expression::StaticMemberExpression(member) = &call.callee {
                 let method_name = member.property.name.as_str();
+                if direct_identifier(&member.object) == Some("TypedShell") {
+                    return Ok(match method_name {
+                        "platform" | "arch" | "homedir" => Some(Type::String),
+                        "setEnv" | "addPath" => Some(Type::Void),
+                        _ => None,
+                    });
+                }
                 if let Some(class_name) = direct_identifier(&member.object)
                     && lookup_class_signature(class_name, imports, classes).is_some()
                 {

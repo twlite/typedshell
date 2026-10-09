@@ -2,6 +2,8 @@
 
 `tsh` is an experimental language implemented in Rust that compiles a statically
 checked subset of TypeScript syntax into readable, standalone shell scripts.
+The crates.io package is named `typedshell`; its Rust library and installed CLI
+are both named `tsh`.
 The Bash backend generates scripts that execute with Bash 3.2 or newer, and the
 PowerShell backend generates scripts for PowerShell 7.4 or newer (PowerShell 5.1
 is out of scope). Generated scripts need no JavaScript runtime or installed
@@ -12,9 +14,29 @@ is out of scope). Generated scripts need no JavaScript runtime or installed
 Build with Rust 1.97 or newer (required by Oxc 0.153):
 
 ```sh
+cargo install typedshell
+# Or install from a local checkout:
 cargo install --path .
 # Or use cargo run -- <arguments> during development.
 ```
+
+Prebuilt releases are available for Linux x86_64/ARM64, macOS Intel/Apple
+silicon, and Windows x86_64. The installer downloads the current release into
+`~/.typedshell` and adds that directory to the user's PATH. Raw Linux/macOS
+release assets can also be downloaded directly; run `chmod +x <asset>` before
+executing them.
+
+```sh
+curl -fsSL https://github.com/twlite/typedshell/releases/latest/download/install.sh | bash
+```
+
+```powershell
+irm https://github.com/twlite/typedshell/releases/latest/download/install.ps1 | iex
+```
+
+Open a new terminal after installation. Running the installer again replaces
+the existing executable with the latest stable release. An installed `tsh` can
+also update itself with `tsh --upgrade`.
 
 ## Usage
 
@@ -24,6 +46,8 @@ tsh examples/arguments.tsh -- --verbose "a path with spaces"
 tsh check examples/hello.tsh
 tsh compile examples/hello.tsh
 tsh compile examples/hello.tsh --target bash --os linux -o hello.sh
+tsh compile examples/hello.tsh --print # Emit generated source to stdout
+tsh -v # Print the installed version
 tsh compile examples/hello.tsh --comments doc
 bash hello.sh
 # PowerShell backend (requires `pwsh` 7.4+ to execute)
@@ -56,6 +80,9 @@ No permanent artifact is written in this mode. Generated source is never
 executed through `eval` (or `Invoke-Expression`).
 
 ## Language
+
+For a focused walkthrough of supported syntax, runtime operations, and
+platform selection, see the [TypedShell guides](docs/README.md).
 
 ```ts
 class User {
@@ -131,6 +158,21 @@ Core shell operations are globally available:
 | `env(name)`                        | Read an environment variable; unset variables yield an empty string |
 | `exit(code)`                       | Terminate the script, defaulting to zero                            |
 
+The `TypedShell` runtime API exposes host details and environment helpers:
+
+| Operation                        | Behavior |
+| -------------------------------- | -------- |
+| `TypedShell.platform()`          | Runtime platform slug such as `linux`, `macos`, `windows`, or `freebsd` |
+| `TypedShell.arch()`              | Normalized architecture such as `x86_64`, `aarch64`, `x86`, or `arm` |
+| `TypedShell.homedir()`           | Current user's home directory |
+| `setEnv(name, value)` / `TypedShell.setEnv(name, value)` | Set a portable shell-style variable for this script and its child processes |
+| `TypedShell.addPath(path)`       | Resolve to an absolute path, prepend it once, and persist it for future shells |
+
+`TypedShell.addPath()` writes Bash/Zsh/Fish startup configuration on Unix and
+updates the current user's PATH on Windows. PowerShell on Unix writes the
+current user's all-hosts profile. PATH list separators (`:` on Unix and `;` on
+Windows) cannot appear inside the added path.
+
 Native command failures terminate the script with the actual failing exit code.
 The backend checks command status explicitly instead of using `set -e` as language
 semantics. Raw shell controls its own failure handling and can change shell state.
@@ -145,7 +187,9 @@ process-directory sync so child processes see the new directory),
 `run()` to a `System.Diagnostics.Process` invocation with an exact .NET
 `ArgumentList` (no wildcard expansion, boundaries preserved),
 `env()` to `[System.Environment]::GetEnvironmentVariable`, and `exit()` to
-`exit`. Every cmdlet failure exits 1; `run()` propagates the real exit code.
+`exit`. `TypedShell.setEnv()` updates the process environment, and
+`TypedShell.addPath()` updates the process PATH plus the user's persistent PATH
+or profile. Every cmdlet failure exits 1; `run()` propagates the real exit code.
 Literal paths are used throughout so wildcard characters are never expanded.
 
 `import { chmod } from "tsh:unix"` provides `chmod(path, 0o755)` for Unix OS targets.
@@ -259,6 +303,66 @@ never Oxc nodes. The PowerShell emitter lives in `src/backends/powershell/`
 (`mod.rs`, `emitter.rs`) behind the same `backends::Backend` trait. Parsing and
 language semantics stay shared; platform-specific operations belong in module
 metadata and target emission.
+
+### Embedding and custom backends
+
+Add the package to your `Cargo.toml`; use `tsh` as the Rust crate name:
+
+```toml
+[dependencies]
+typedshell = "0.1"
+```
+
+`compile_source` compiles source text, and `compile_file` resolves and bundles
+local imports from a file. Both return generated shell source that your host
+application can write, inspect, or execute with `tsh::runner::run` or
+`tsh::runner::run_pwsh`.
+Runnable examples are in [`embed_source.rs`](https://github.com/twlite/typedshell/blob/main/examples/embed_source.rs)
+and [`embed_file.rs`](https://github.com/twlite/typedshell/blob/main/examples/embed_file.rs).
+
+To add an output format, implement `tsh::backends::Backend` and pass the
+`Program` returned by `check_file` to it. The example
+[`custom_backend.rs`](https://github.com/twlite/typedshell/blob/main/examples/custom_backend.rs)
+implements a small JSON summary backend over the validated typed IR.
+
+```sh
+cargo run --example embed_source
+cargo run --example embed_file -- examples/imports.tsh
+cargo run --example custom_backend
+```
+
+## Publishing
+
+The [`typedshell` crate](https://crates.io/crates/typedshell) is registered, and
+version `0.1.0` is already published. Choose an unpublished SemVer version,
+then run these commands from the repository root (replace `0.1.1` if that
+version has also been taken):
+
+```sh
+cargo login
+python3 scripts/set-version.py 0.1.1
+cargo publish --dry-run --locked --allow-dirty
+cargo publish --locked --allow-dirty
+```
+
+`--allow-dirty` is needed while these release-preparation changes are uncommitted;
+omit it if you commit them locally first. Confirm that your selected version is
+not already published before running the final `cargo publish` command.
+
+After these workflow changes are pushed to GitHub, follow the
+[crates.io Trusted Publishing setup](https://crates.io/docs/trusted-publishing) and configure
+crates.io **Trusted Publishing** for owner `twlite`, repository `typedshell`, and
+workflow `.github/workflows/publish.yml` (leave the environment empty). Then
+future releases can be started from **Actions → Publish → Run workflow** with a
+version not already published, such as `0.1.1` or `0.2.0-rc.1`, or by pushing to
+`main` a commit message containing one unique matching version, such as
+`release 0.1.1`. The workflow changes the manifest and lockfile in its temporary
+runner checkout to publish the requested version; it does not create a
+version-bump commit.
+
+If you publish a version locally first, do not put that same version in the
+commit that first pushes this workflow; the push trigger would try to publish it
+again. The workflow only publishes on `main`.
 
 ## Development
 

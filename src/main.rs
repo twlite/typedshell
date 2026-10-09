@@ -1,4 +1,6 @@
 mod cli;
+mod updater;
+
 fn main() {
     match cli::execute() {
         Ok(code) => std::process::exit(code),

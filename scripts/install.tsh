@@ -1,0 +1,52 @@
+// @cfg(shell("bash"))
+import { chmod } from "tsh:unix";
+
+const platform = TypedShell.platform();
+const architecture = TypedShell.arch();
+const home = TypedShell.homedir();
+
+let asset = "";
+if (platform == "linux") {
+  if (architecture == "x86_64") {
+    asset = "typedshell-linux-x86_64";
+  } else if (architecture == "aarch64") {
+    asset = "typedshell-linux-aarch64";
+  }
+} else if (platform == "macos") {
+  if (architecture == "x86_64") {
+    asset = "typedshell-macos-x86_64";
+  } else if (architecture == "aarch64") {
+    asset = "typedshell-macos-aarch64";
+  }
+}
+
+// @cfg(shell("pwsh"))
+if (platform == "windows" && architecture == "x86_64") {
+  asset = "typedshell-windows-x86_64.exe";
+}
+
+if (asset == "") {
+  echo(`Unsupported TypedShell install target: ${platform}/${architecture}`);
+  exit(1);
+}
+
+const installDir = `${home}/.typedshell`;
+let executable = `${installDir}/tsh`;
+if (platform == "windows") {
+  executable = `${executable}.exe`;
+}
+const downloadPath = `${installDir}/tsh-download.tmp`;
+const downloadUrl = `https://github.com/twlite/typedshell/releases/latest/download/${asset}`;
+
+mkdir(installDir, { recursive: true });
+// @cfg(shell("bash"))
+run("curl", ["-fLsS", "--retry", "3", "-o", downloadPath, downloadUrl]);
+// @cfg(shell("pwsh"))
+run("curl.exe", ["-fLsS", "--retry", "3", "-o", downloadPath, downloadUrl]);
+mv(downloadPath, executable);
+
+// @cfg(shell("bash"))
+chmod(executable, 0o755);
+
+TypedShell.addPath(installDir);
+echo(`Installed tsh to ${executable}. Open a new terminal to use it from PATH.`);

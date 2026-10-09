@@ -21,7 +21,7 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     backends::powershell::ps_quote,
     compiler::diagnostics::CompileError,
-    ir::{Class, Command, Expr, ExprKind, Function, Method, Place, Program, Stmt, Type},
+    ir::{Class, Command, Expr, ExprKind, Function, HostInfo, Method, Place, Program, Stmt, Type},
 };
 
 /// Entry point used by the `Backend` implementation.
@@ -195,6 +195,12 @@ impl<'a> Emitter<'a> {
         for _ in 0..self.indent {
             self.code.push_str("    ");
         }
+        self.code.push_str(text);
+        self.code.push('\n');
+    }
+
+    // PowerShell here-string terminators must begin in column one.
+    fn line_unindented(&mut self, text: &str) {
         self.code.push_str(text);
         self.code.push('\n');
     }
@@ -523,6 +529,7 @@ impl<'a> Emitter<'a> {
                 expression.ty.clone(),
             ),
             ExprKind::Env(key) => self.emit_env(key, expression.ty.clone()),
+            ExprKind::HostInfo(info) => Ok(self.emit_host_info(*info, expression.ty.clone())),
         }
     }
 
@@ -747,6 +754,59 @@ impl<'a> Emitter<'a> {
         Ok(Value::temp(result, result_type))
     }
 
+    fn emit_host_info(&mut self, info: HostInfo, result_type: Type) -> Value {
+        let result = self.fresh_temp();
+        match info {
+            HostInfo::Platform => {
+                self.line(&format!("${result} = 'unknown'"));
+                self.line(
+                    &format!(
+                        "if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {{ ${result} = 'windows' }}"
+                    ),
+                );
+                self.line(
+                    &format!(
+                        "elseif ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)) {{ ${result} = 'linux' }}"
+                    ),
+                );
+                self.line(
+                    &format!(
+                        "elseif ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) {{ ${result} = 'macos' }}"
+                    ),
+                );
+                self.line(
+                    &format!(
+                        "elseif ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Create('FREEBSD'))) {{ ${result} = 'freebsd' }}"
+                    ),
+                );
+            }
+            HostInfo::Architecture => {
+                let architecture = self.fresh_temp();
+                self.line(&format!(
+                    "${architecture} = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()"
+                ));
+                self.line(&format!("switch (${architecture}) {{"));
+                self.indent += 1;
+                self.line(&format!("'X64' {{ ${result} = 'x86_64' }}"));
+                self.line(&format!("'Arm64' {{ ${result} = 'aarch64' }}"));
+                self.line(&format!("'X86' {{ ${result} = 'x86' }}"));
+                self.line(&format!("'Arm' {{ ${result} = 'arm' }}"));
+                self.line(&format!(
+                    "default {{ ${result} = ${architecture}.ToLowerInvariant() }}"
+                ));
+                self.indent -= 1;
+                self.line("}");
+            }
+            HostInfo::HomeDir => {
+                self.line(&format!(
+                    "${result} = [System.Environment]::GetFolderPath([System.Environment+SpecialFolder]::UserProfile)"
+                ));
+                self.line(&format!("if (-not ${result}) {{ ${result} = $HOME }}"));
+            }
+        }
+        Value::temp(result, result_type)
+    }
+
     fn emit_command(
         &mut self,
         kind: Command,
@@ -789,6 +849,23 @@ impl<'a> Emitter<'a> {
                 }
                 self.line(&format!("[Console]::WriteLine(${result})"));
             }
+            Command::SetEnv => {
+                if args.len() != 2 {
+                    return Err(CompileError::plain(
+                        "`TypedShell.setEnv` expects a name and value in PowerShell IR",
+                    ));
+                }
+                let values = self.capture_arguments(args)?;
+                self.line(&format!(
+                    "if ({} -cnotmatch '^[A-Za-z_][A-Za-z0-9_]*$') {{ exit 1 }}",
+                    values[0].expr
+                ));
+                self.line(&format!(
+                    "[System.Environment]::SetEnvironmentVariable({}, {}, 'Process')",
+                    values[0].expr, values[1].expr
+                ));
+            }
+            Command::AddPath => self.emit_add_path(args)?,
             Command::Mkdir => {
                 if args.is_empty() {
                     return Err(CompileError::plain(
@@ -972,6 +1049,99 @@ impl<'a> Emitter<'a> {
                 self.checked("chmod");
             }
         }
+        Ok(())
+    }
+
+    fn emit_add_path(&mut self, args: &[Expr]) -> Result<(), CompileError> {
+        if args.len() != 1 {
+            return Err(CompileError::plain(
+                "`TypedShell.addPath` expects one path in PowerShell IR",
+            ));
+        }
+        let value = self.capture_arguments(args)?.remove(0);
+        let path = value.expr;
+        self.line(&format!(
+            "$__tsh_path = [System.IO.Path]::GetFullPath([string]({path}))"
+        ));
+        self.line(
+            "if ([string]::IsNullOrEmpty($__tsh_path) -or $__tsh_path.Contains([string][System.IO.Path]::PathSeparator)) { throw 'TypedShell.addPath expects a non-empty path without a PATH separator.' }",
+        );
+        self.line("$__tsh_separator = [string][System.IO.Path]::PathSeparator");
+        self.line("$__tsh_comparison = [System.StringComparison]::Ordinal");
+        self.line(
+            "if ($IsWindows) { $__tsh_comparison = [System.StringComparison]::OrdinalIgnoreCase }",
+        );
+        self.line("$__tsh_normalized = $__tsh_path.TrimEnd([char[]]@('\\', '/'))");
+        self.line("if (-not $__tsh_normalized) { $__tsh_normalized = $__tsh_path }");
+        self.line(
+            "$__tsh_process_entries = @($env:PATH -split [regex]::Escape($__tsh_separator) | Where-Object { $_ })",
+        );
+        self.line("$__tsh_process_has_path = $false");
+        self.line("foreach ($__tsh_entry in $__tsh_process_entries) {");
+        self.indent += 1;
+        self.line(
+            "if ($__tsh_entry.TrimEnd([char[]]@('\\', '/')).Equals($__tsh_normalized, $__tsh_comparison)) { $__tsh_process_has_path = $true; break }",
+        );
+        self.indent -= 1;
+        self.line("}");
+        self.line("if (-not $__tsh_process_has_path) {");
+        self.indent += 1;
+        self.line("if ($env:PATH) { $env:PATH = \"$__tsh_path$__tsh_separator$env:PATH\" } else { $env:PATH = $__tsh_path }");
+        self.indent -= 1;
+        self.line("}");
+        self.line("if ($IsWindows) {");
+        self.indent += 1;
+        self.line(
+            "$__tsh_user_path = [System.Environment]::GetEnvironmentVariable('Path', 'User')",
+        );
+        self.line("$__tsh_user_entries = @($__tsh_user_path -split ';' | Where-Object { $_ })");
+        self.line("$__tsh_user_has_path = $false");
+        self.line("foreach ($__tsh_entry in $__tsh_user_entries) {");
+        self.indent += 1;
+        self.line(
+            "if ($__tsh_entry.TrimEnd([char[]]@('\\', '/')).Equals($__tsh_normalized, [System.StringComparison]::OrdinalIgnoreCase)) { $__tsh_user_has_path = $true; break }",
+        );
+        self.indent -= 1;
+        self.line("}");
+        self.line("if (-not $__tsh_user_has_path) {");
+        self.indent += 1;
+        self.line(
+            "[System.Environment]::SetEnvironmentVariable('Path', (@($__tsh_user_entries) + $__tsh_path) -join ';', 'User')",
+        );
+        self.line("try {");
+        self.indent += 1;
+        self.line("if (-not ('TypedShellInstallEnvironment' -as [type])) {");
+        self.indent += 1;
+        self.line("Add-Type -TypeDefinition @'");
+        self.line("using System;");
+        self.line("using System.Runtime.InteropServices;");
+        self.line("public static class TypedShellInstallEnvironment {");
+        self.line("    [DllImport(\"user32.dll\", CharSet = CharSet.Auto, SetLastError = true)]");
+        self.line("    public static extern IntPtr SendMessageTimeout(");
+        self.line("        IntPtr hWnd, int message, IntPtr wParam, string lParam,");
+        self.line("        int flags, int timeout, out IntPtr result);");
+        self.line("}");
+        self.line_unindented("'@");
+        self.indent -= 1;
+        self.line("}");
+        self.line("$__tsh_broadcast_result = [IntPtr]::Zero");
+        self.line("[TypedShellInstallEnvironment]::SendMessageTimeout([IntPtr]::new(-1), 0x001A, [IntPtr]::Zero, 'Environment', 0x0002, 5000, [ref]$__tsh_broadcast_result) | Out-Null");
+        self.indent -= 1;
+        self.line("} catch { Write-Warning 'The user PATH was saved. Open a new terminal to reload it.' }");
+        self.indent -= 1;
+        self.line("}");
+        self.indent -= 1;
+        self.line("} else {");
+        self.indent += 1;
+        self.line("$__tsh_profile_path = $PROFILE.CurrentUserAllHosts");
+        self.line("$__tsh_profile_dir = [System.IO.Path]::GetDirectoryName($__tsh_profile_path)");
+        self.line("$null = [System.IO.Directory]::CreateDirectory($__tsh_profile_dir)");
+        self.line("$__tsh_path_literal = \"'\" + $__tsh_normalized.Replace(\"'\", \"''\") + \"'\"");
+        self.line("$__tsh_profile_line = '$candidate = ' + $__tsh_path_literal + '; $entries = @($env:PATH -split [regex]::Escape([string][System.IO.Path]::PathSeparator)); if ($entries -cnotcontains $candidate) { $env:PATH = if ($env:PATH) { $candidate + [System.IO.Path]::PathSeparator + $env:PATH } else { $candidate } }'");
+        self.line("$__tsh_profile_text = if (Test-Path -LiteralPath $__tsh_profile_path) { [System.IO.File]::ReadAllText($__tsh_profile_path) } else { '' }");
+        self.line("if (-not $__tsh_profile_text.Contains($__tsh_profile_line)) { [System.IO.File]::AppendAllText($__tsh_profile_path, [System.Environment]::NewLine + $__tsh_profile_line + [System.Environment]::NewLine) }");
+        self.indent -= 1;
+        self.line("}");
         Ok(())
     }
 
@@ -1245,7 +1415,10 @@ fn validate_statements(statements: &[Stmt]) -> Result<(), CompileError> {
 
 fn validate_expr(expression: &Expr) -> Result<(), CompileError> {
     match &expression.kind {
-        ExprKind::String(_) | ExprKind::Number(_) | ExprKind::Boolean(_) => {}
+        ExprKind::String(_)
+        | ExprKind::Number(_)
+        | ExprKind::Boolean(_)
+        | ExprKind::HostInfo(_) => {}
         ExprKind::Variable(name) => {
             if name != "__tsh_this" && !is_safe_identifier(name) {
                 return Err(CompileError::plain(format!(

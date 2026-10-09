@@ -9,7 +9,10 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     backends::Backend,
     compiler::diagnostics::CompileError,
-    ir::{Class, Command, Expr, ExprKind, Field, Function, Method, Place, Program, Stmt, Type},
+    ir::{
+        Class, Command, Expr, ExprKind, Field, Function, HostInfo, Method, Place, Program, Stmt,
+        Type,
+    },
 };
 
 /// The Bash 3.2 backend.
@@ -273,7 +276,10 @@ fn collect_expression_variables(expression: &Expr, names: &mut HashSet<String>) 
                 collect_expression_variables(argument, names);
             }
         }
-        ExprKind::String(_) | ExprKind::Number(_) | ExprKind::Boolean(_) => {}
+        ExprKind::String(_)
+        | ExprKind::Number(_)
+        | ExprKind::Boolean(_)
+        | ExprKind::HostInfo(_) => {}
     }
 }
 
@@ -618,6 +624,7 @@ impl<'a, 'n> Writer<'a, 'n> {
                 expression.ty.clone(),
             ),
             ExprKind::Env(key) => self.emit_env(key, expression.ty.clone()),
+            ExprKind::HostInfo(info) => self.emit_host_info(*info, expression.ty.clone()),
         }
     }
 
@@ -893,6 +900,41 @@ impl<'a, 'n> Writer<'a, 'n> {
         Ok(Value::new(shell_expansion(&result), None, result_type).named(result))
     }
 
+    fn emit_host_info(&mut self, info: HostInfo, result_type: Type) -> Result<Value, CompileError> {
+        let result = self.fresh_temp();
+        match info {
+            HostInfo::Platform => {
+                let detected = self.fresh_temp();
+                self.line(&format!("{detected}=\"$(uname -s 2>/dev/null || true)\""));
+                self.line(&format!("{result}='unknown'"));
+                self.line(&format!("case \"${{{detected}}}\" in"));
+                self.indent += 1;
+                self.line(&format!("Linux*) {result}='linux' ;;"));
+                self.line(&format!("Darwin*) {result}='macos' ;;"));
+                self.line(&format!("FreeBSD*) {result}='freebsd' ;;"));
+                self.line(&format!("OpenBSD*) {result}='openbsd' ;;"));
+                self.line(&format!("NetBSD*) {result}='netbsd' ;;"));
+                self.line(&format!("SunOS*) {result}='solaris' ;;"));
+                self.line(&format!("CYGWIN*|MINGW*|MSYS*) {result}='windows' ;;"));
+                self.indent -= 1;
+                self.line("esac");
+            }
+            HostInfo::Architecture => {
+                self.line(&format!("{result}=\"$(uname -m 2>/dev/null || true)\""));
+                self.line(&format!("case \"${{{result}}}\" in"));
+                self.indent += 1;
+                self.line(&format!("x86_64|amd64|AMD64) {result}='x86_64' ;;"));
+                self.line(&format!("aarch64|arm64|ARM64) {result}='aarch64' ;;"));
+                self.line(&format!("i386|i486|i586|i686|x86) {result}='x86' ;;"));
+                self.line(&format!("armv*|ARMV*) {result}='arm' ;;"));
+                self.indent -= 1;
+                self.line("esac");
+            }
+            HostInfo::HomeDir => self.line(&format!("{result}=\"${{HOME-}}\"")),
+        }
+        Ok(Value::new(shell_expansion(&result), None, result_type).named(result))
+    }
+
     fn emit_command(
         &mut self,
         kind: Command,
@@ -943,6 +985,27 @@ impl<'a, 'n> Writer<'a, 'n> {
                 };
                 self.emit_checked_command(&command);
             }
+            Command::SetEnv => {
+                if args.len() != 2 {
+                    return Err(CompileError::plain(
+                        "`TypedShell.setEnv` expects a name and value in Bash IR",
+                    ));
+                }
+                let values = self.capture_arguments(args)?;
+                self.line(&format!(
+                    "if [[ {} =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then",
+                    values[0].word
+                ));
+                self.indent += 1;
+                self.emit_checked_command(&format!("export {}={}", values[0].word, values[1].word));
+                self.indent -= 1;
+                self.line("else");
+                self.indent += 1;
+                self.line("exit 1");
+                self.indent -= 1;
+                self.line("fi");
+            }
+            Command::AddPath => self.emit_add_path(args)?,
             Command::Mkdir
             | Command::Rm
             | Command::Cp
@@ -1012,6 +1075,111 @@ impl<'a, 'n> Writer<'a, 'n> {
                 ));
             }
         }
+        Ok(())
+    }
+
+    fn emit_add_path(&mut self, args: &[Expr]) -> Result<(), CompileError> {
+        if args.len() != 1 {
+            return Err(CompileError::plain(
+                "`TypedShell.addPath` expects one path in Bash IR",
+            ));
+        }
+        let value = self.capture_arguments(args)?.remove(0);
+        let path = self.fresh_temp();
+        self.line(&format!("{path}={}", value.word));
+        self.line(&format!(
+            "if [[ \"${{{path}}}\" != /* ]]; then {path}=\"$PWD/${{{path}}}\"; fi"
+        ));
+        self.line(&format!(
+            "while [[ \"${{{path}}}\" != / && \"${{{path}}}\" == */ ]]; do {path}=\"${{{path}%/}}\"; done"
+        ));
+        self.line(&format!(
+            "if [[ -z \"${{{path}}}\" || \"${{{path}}}\" == *:* ]]; then"
+        ));
+        self.indent += 1;
+        self.line("exit 1");
+        self.indent -= 1;
+        self.line("fi");
+        self.line(&format!(
+            "case \":${{PATH-}}:\" in *:\"${{{path}}}\":*) ;; *) if [[ -n \"${{PATH-}}\" ]]; then export PATH=\"${{{path}}}:${{PATH}}\"; else export PATH=\"${{{path}}}\"; fi ;; esac"
+        ));
+
+        let escaped = self.fresh_temp();
+        self.line(&format!("{escaped}=${{{path}//\\\\/\\\\\\\\}}"));
+        self.line(&format!("{escaped}=${{{escaped}//\\\"/\\\\\\\"}}"));
+        self.line(&format!("{escaped}=${{{escaped}//\\$/\\\\\\$}}"));
+        self.line(&format!("{escaped}=${{{escaped}//\\`/\\\\\\`}}"));
+        let profile_line = self.fresh_temp();
+        self.line(&format!(
+            "printf -v {profile_line} 'case \":$PATH:\" in *:\"%s:\"*) ;; *) if [ -n \"$PATH\" ]; then export PATH=\"%s:$PATH\"; else export PATH=\"%s\"; fi ;; esac' \"${{{escaped}}}\" \"${{{escaped}}}\" \"${{{escaped}}}\""
+        ));
+        let add_profile_fn = "__tsh_add_profile_line";
+        self.line(&format!("{add_profile_fn}() {{"));
+        self.indent += 1;
+        self.line("local profile_path=\"$1\" path_line=\"$2\"");
+        self.line("if ! grep -Fqx \"$path_line\" \"$profile_path\" 2>/dev/null; then");
+        self.indent += 1;
+        self.line("mkdir -p -- \"$(dirname \"$profile_path\")\" || exit $?");
+        self.line("printf '\\n%s\\n' \"$path_line\" >> \"$profile_path\" || exit $?");
+        self.indent -= 1;
+        self.line("fi");
+        self.indent -= 1;
+        self.line("}");
+        self.line("case \"${SHELL-}\" in");
+        self.indent += 1;
+        self.line(&format!(
+            "*/zsh) {add_profile_fn} \"$HOME/.zshrc\" \"${{{profile_line}}}\"; {add_profile_fn} \"$HOME/.zprofile\" \"${{{profile_line}}}\" ;;"
+        ));
+        self.line("*/bash)");
+        self.indent += 1;
+        self.line(&format!(
+            "{add_profile_fn} \"$HOME/.bashrc\" \"${{{profile_line}}}\""
+        ));
+        self.line("if [ -f \"$HOME/.bash_profile\" ]; then");
+        self.indent += 1;
+        self.line(&format!(
+            "{add_profile_fn} \"$HOME/.bash_profile\" \"${{{profile_line}}}\""
+        ));
+        self.indent -= 1;
+        self.line("elif [ -f \"$HOME/.bash_login\" ]; then");
+        self.indent += 1;
+        self.line(&format!(
+            "{add_profile_fn} \"$HOME/.bash_login\" \"${{{profile_line}}}\""
+        ));
+        self.indent -= 1;
+        self.line("else");
+        self.indent += 1;
+        self.line(&format!(
+            "{add_profile_fn} \"$HOME/.profile\" \"${{{profile_line}}}\""
+        ));
+        self.indent -= 1;
+        self.line("fi");
+        self.indent -= 1;
+        self.line(";;");
+        self.line("*/fish)");
+        self.indent += 1;
+        let fish_path = self.fresh_temp();
+        self.line(&format!("{fish_path}=${{{path}}}"));
+        self.line(&format!("{fish_path}=${{{fish_path}//\\\\/\\\\\\\\}}"));
+        self.line(&format!("{fish_path}=${{{fish_path}//\\'/\\\\\\'}}"));
+        let fish_line = self.fresh_temp();
+        self.line(&format!(
+            "printf -v {fish_line} \"fish_add_path '%s'\" \"${{{fish_path}}}\""
+        ));
+        self.line(&format!(
+            "{add_profile_fn} \"$HOME/.config/fish/conf.d/typedshell.fish\" \"${{{fish_line}}}\""
+        ));
+        self.indent -= 1;
+        self.line(";;");
+        self.line("*)");
+        self.indent += 1;
+        self.line(&format!(
+            "{add_profile_fn} \"$HOME/.profile\" \"${{{profile_line}}}\""
+        ));
+        self.indent -= 1;
+        self.line(";;");
+        self.indent -= 1;
+        self.line("esac");
         Ok(())
     }
 
@@ -1374,7 +1542,10 @@ fn validate_statements(statements: &[Stmt]) -> Result<(), CompileError> {
 
 fn validate_expr(expression: &Expr) -> Result<(), CompileError> {
     match &expression.kind {
-        ExprKind::String(_) | ExprKind::Number(_) | ExprKind::Boolean(_) => {}
+        ExprKind::String(_)
+        | ExprKind::Number(_)
+        | ExprKind::Boolean(_)
+        | ExprKind::HostInfo(_) => {}
         ExprKind::Variable(name) => validate_identifier(name)?,
         ExprKind::Template(parts) => {
             for part in parts {

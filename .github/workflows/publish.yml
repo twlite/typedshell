@@ -1,0 +1,207 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to publish (for example 0.2.0 or 0.2.0-rc.1)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  resolve-version:
+    name: Resolve release version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Read the requested version
+        id: version
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          RELEASE_REF: ${{ github.ref }}
+          INPUT_VERSION: ${{ inputs.version }}
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          number = r"(?:0|[1-9][0-9]*)"
+          prerelease_identifier = (
+              rf"(?:{number}|[0-9A-Za-z-]*[A-Za-z-][0-9A-Za-z-]*)"
+          )
+          version_pattern = re.compile(
+              rf"{number}\.{number}\.{number}"
+              rf"(?:-{prerelease_identifier}(?:\.{prerelease_identifier})*)?"
+          )
+          event_name = os.environ["EVENT_NAME"]
+
+          if event_name == "workflow_dispatch":
+              if os.environ["RELEASE_REF"] != "refs/heads/main":
+                  raise SystemExit("Dispatch Publish from the main branch.")
+              version = os.environ["INPUT_VERSION"].strip()
+              if not version_pattern.fullmatch(version):
+                  raise SystemExit(
+                      "Version must have an N.N.N core and an optional valid SemVer prerelease."
+                  )
+          else:
+              token_pattern = re.compile(
+                  rf"(?<![0-9A-Za-z.+-])({version_pattern.pattern})(?![0-9A-Za-z.+-])"
+              )
+              matches = token_pattern.findall(os.environ.get("COMMIT_MESSAGE", ""))
+              versions = list(dict.fromkeys(matches))
+              if not versions:
+                  print("No release version in the commit message; skipping publish.")
+                  version = ""
+              elif len(versions) != 1:
+                  raise SystemExit(
+                      "Commit message has multiple release versions; use one version token."
+                  )
+              else:
+                  version = versions[0]
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={version}", file=output)
+          PY
+
+  build-release:
+    name: Build ${{ matrix.asset }}
+    needs: resolve-version
+    if: needs.resolve-version.outputs.version != '' && github.ref == 'refs/heads/main'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            asset: typedshell-linux-x86_64
+            executable: tsh
+          - runner: ubuntu-24.04-arm
+            asset: typedshell-linux-aarch64
+            executable: tsh
+          - runner: macos-15-intel
+            asset: typedshell-macos-x86_64
+            executable: tsh
+          - runner: macos-15
+            asset: typedshell-macos-aarch64
+            executable: tsh
+          - runner: windows-latest
+            asset: typedshell-windows-x86_64.exe
+            executable: tsh.exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Override the package version for this build (Unix)
+        if: runner.os != 'Windows'
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        shell: bash
+        run: python3 scripts/set-version.py "$VERSION"
+
+      - name: Override the package version for this build (Windows)
+        if: runner.os == 'Windows'
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        shell: pwsh
+        run: py -3 scripts/set-version.py $env:VERSION
+
+      - name: Build release executable
+        run: cargo build --release --locked --bin tsh
+
+      - name: Stage release executable
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          ASSET_NAME: ${{ matrix.asset }}
+          EXECUTABLE_NAME: ${{ matrix.executable }}
+        run: |
+          mkdir -p release-assets
+          cp "target/release/$EXECUTABLE_NAME" "release-assets/$ASSET_NAME"
+
+      - name: Stage release executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          ASSET_NAME: ${{ matrix.asset }}
+          EXECUTABLE_NAME: ${{ matrix.executable }}
+        run: |
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Copy-Item "target/release/$env:EXECUTABLE_NAME" "release-assets/$env:ASSET_NAME"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-assets-${{ matrix.asset }}
+          path: release-assets/${{ matrix.asset }}
+          if-no-files-found: error
+
+  publish:
+    name: Publish ${{ needs.resolve-version.outputs.version }}
+    needs: [resolve-version, build-release]
+    if: needs.resolve-version.outputs.version != '' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Override the package version for this publish
+        env:
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        run: python3 scripts/set-version.py "$VERSION"
+
+      - name: Test and package the requested version
+        run: |
+          cargo test --all-targets --locked
+          cargo package --locked --allow-dirty
+
+      - name: Download release executables
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-assets-*
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate installers and checksums
+        run: |
+          bash scripts/generate-installers.sh
+          cp scripts/install.sh scripts/install.ps1 release-assets/
+          (cd release-assets && sha256sum * > SHA256SUMS)
+
+      - name: Authenticate with crates.io using OIDC
+        id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+
+      - name: Publish to crates.io
+        run: cargo publish --locked --allow-dirty
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+
+      - name: Create GitHub release with executables and installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.resolve-version.outputs.version }}
+        shell: bash
+        run: |
+          release_args=(
+            "v$VERSION"
+            release-assets/*
+            --title "TypedShell $VERSION"
+            --generate-notes
+            --target "$GITHUB_SHA"
+          )
+          if [[ "$VERSION" == *-* ]]; then
+            gh release create "${release_args[@]}" --prerelease
+          else
+            gh release create "${release_args[@]}"
+          fi

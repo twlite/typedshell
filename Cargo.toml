@@ -1,10 +1,26 @@
 [package]
-name = "tsh"
+name = "typedshell"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.97"
+authors = ["Twilight <hello@twlite.dev>"]
 description = "A typed TypeScript subset compiled to standalone Bash or other shell targets"
 license = "MIT"
+repository = "https://github.com/twlite/typedshell"
+documentation = "https://docs.rs/typedshell"
+readme = "README.md"
+keywords = ["typescript", "shell", "compiler", "bash", "powershell"]
+categories = ["command-line-utilities", "compilers"]
+default-run = "tsh"
+exclude = ["/.github/", "/.gitattributes", "/.gitignore"]
+
+[lib]
+name = "tsh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tsh"
+path = "src/main.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

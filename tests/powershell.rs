@@ -293,6 +293,108 @@ fn pwsh_env_without_execution() {
 }
 
 #[test]
+fn pwsh_typedshell_host_info_and_environment_api() {
+    let out = output(
+        "echo(TypedShell.platform()); echo(TypedShell.arch()); echo(TypedShell.homedir() != ''); TypedShell.setEnv('TSH_TYPEDSHELL_API', 'a b $HOME'); echo(env('TSH_TYPEDSHELL_API'));",
+    );
+    let mut lines = out.lines();
+    let expected_platform = match std::env::consts::OS {
+        "linux" => "linux",
+        "macos" => "macos",
+        "windows" => "windows",
+        other => other,
+    };
+    let expected_arch = match std::env::consts::ARCH {
+        "x86_64" | "amd64" => "x86_64",
+        "aarch64" | "arm64" => "aarch64",
+        "x86" | "i386" | "i586" | "i686" => "x86",
+        "arm" | "armv7" | "armv7l" => "arm",
+        other => other,
+    };
+    assert_eq!(lines.next(), Some(expected_platform));
+    assert_eq!(lines.next(), Some(expected_arch));
+    assert_eq!(lines.next(), Some("true"));
+    assert_eq!(lines.next(), Some("a b $HOME"));
+    assert_eq!(lines.next(), None);
+}
+
+#[test]
+fn pwsh_add_path_is_idempotent_and_persists_to_user_profile() {
+    requires_pwsh();
+    if cfg!(windows) {
+        // The Windows implementation updates the current user's PATH registry
+        // value, so keep this filesystem integration test on Unix hosts.
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let path_entry = format!("{}/tools with ' quote", home.path().display());
+    let source = format!(
+        "TypedShell.addPath(\"{path_entry}\"); TypedShell.addPath(\"{path_entry}\"); echo(env('PATH'));"
+    );
+    let script_dir = tempfile::tempdir().unwrap();
+    let script_path = script_dir.path().join("add-path.ps1");
+    std::fs::write(&script_path, compile(&source)).unwrap();
+    let out = Command::new("pwsh")
+        .args(["-NoProfile", "-File"])
+        .arg(&script_path)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let path_output = String::from_utf8(out.stdout).unwrap();
+    assert_eq!(
+        path_output.matches(&path_entry).count(),
+        1,
+        "PATH output was: {path_output:?}"
+    );
+
+    let profile = home.path().join(".config/powershell/profile.ps1");
+    let profile_contents = std::fs::read_to_string(&profile).unwrap();
+    assert_eq!(profile_contents.matches("$candidate = ").count(), 1);
+    let profile_result = Command::new("pwsh")
+        .args(["-NoProfile", "-File"])
+        .arg(&profile)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        profile_result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&profile_result.stderr)
+    );
+
+    let verify_script = script_dir.path().join("verify-profile.ps1");
+    let profile_literal = profile.to_string_lossy().replace("'", "''");
+    std::fs::write(
+        &verify_script,
+        format!(". '{profile_literal}'; . '{profile_literal}'; [Console]::WriteLine($env:PATH)"),
+    )
+    .unwrap();
+    let profile_output = Command::new("pwsh")
+        .args(["-NoProfile", "-File"])
+        .arg(verify_script)
+        .env("HOME", home.path())
+        .output()
+        .unwrap();
+    assert!(
+        profile_output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&profile_output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8(profile_output.stdout)
+            .unwrap()
+            .matches(&path_entry)
+            .count(),
+        1
+    );
+}
+
+#[test]
 fn pwsh_os_specific_imports_follow_target_os() {
     let unix_options = CompileOptions {
         os: TargetOs::Macos,
@@ -582,11 +684,9 @@ fn pwsh_cli_forwards_arguments_stdin_and_exit_status() {
 }
 
 #[test]
+#[cfg(unix)]
 fn pwsh_chmod_sets_unix_modes() {
     use std::os::unix::fs::PermissionsExt;
-    if options().os == TargetOs::Windows {
-        return;
-    }
     requires_pwsh();
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("f"), "x").unwrap();
